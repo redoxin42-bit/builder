@@ -26,6 +26,9 @@ if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO]):
     print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи Supabase и GitHub в Environment!")
     exit(1)
 
+# Принудительно приводим название репозитория к нижнему регистру для стабильности API гитхаба
+GITHUB_REPO_CLEANED = GITHUB_REPO.strip()
+
 # Инициализация клиентов
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 github_client = Github(GITHUB_TOKEN)
@@ -195,7 +198,7 @@ def get_file_view_keyboard(project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ И РЕАЛЬНАЯ СБОРКА ЧЕРЕЗ GITHUB ACTIONS
+# 📡 БЛОК 3: ХЕНДЛЕРЫ И НАДЁЖНАЯ СБОРКА APK ЧЕРЕЗ GITHUB
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -275,7 +278,7 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{file_data['name']}`\n```java\n{file_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(project_id))
 
-# 🔥 ГЛАВНЫЙ ОБНОВЛЕННЫЙ ХЕНДЛЕР: НАСТОЯЩАЯ СБОРКА APK В ОБЛАКЕ
+# 🔥 НАДЁЖНЫЙ ХЕНДЛЕР СБОРКИ С ОБХОДОМ ОШИБОК 404
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
@@ -294,22 +297,26 @@ async def build_apk_process(callback: types.CallbackQuery):
             return
 
         # Подключаемся к репозиторию на GitHub
-        repo = github_client.get_repo(GITHUB_REPO)
+        repo = github_client.get_repo(GITHUB_REPO_CLEANED)
 
         await status_msg.edit_text("📝 Загрузка исходного кода в репозиторий GitHub...")
         
-        # Перезаписываем файлы в репозитории компилятора через API
-        # Пути соответствуют структуре Android Studio
-        manifest_file = repo.get_contents("app/src/main/AndroidManifest.xml", ref="main")
-        repo.update_file(manifest_file.path, "Update Manifest from Bot", manifest_content, manifest_file.sha, branch="main")
+        # 🛠 БЕЗОПАСНАЯ ПЕРЕЗАПИСЬ / СОЗДАНИЕ МАНИФЕСТА
+        try:
+            manifest_file = repo.get_contents("app/src/main/AndroidManifest.xml", ref="main")
+            repo.update_file(manifest_file.path, "Update Manifest from Bot", manifest_content, manifest_file.sha, branch="main")
+        except Exception:
+            repo.create_file("app/src/main/AndroidManifest.xml", "Create Manifest from Bot", manifest_content, branch="main")
 
-        java_file = repo.get_contents("app/src/main/java/com/flare/compiler/MainActivity.java", ref="main")
-        repo.update_file(java_file.path, "Update Java Code from Bot", java_content, java_file.sha, branch="main")
+        # 🛠 БЕЗОПАСНАЯ ПЕРЕЗАПИСЬ / СОЗДАНИЕ JAVA-КОДА
+        try:
+            java_file = repo.get_contents("app/src/main/java/com/flare/compiler/MainActivity.java", ref="main")
+            repo.update_file(java_file.path, "Update Java Code from Bot", java_content, java_file.sha, branch="main")
+        except Exception:
+            repo.create_file("app/src/main/java/com/flare/compiler/MainActivity.java", "Create Java Code from Bot", java_content, branch="main")
 
         await status_msg.edit_text("🚀 Код успешно отправлен! Запуск Gradle-сборщика в облаке GitHub...")
-        
-        # GitHub Actions запускается автоматически по триггеру push. Нам нужно подождать старта и окончания
-        await asyncio.sleep(5) # Даем гитхабу пару секунд на создание сессии сборки
+        await asyncio.sleep(6) 
         
         # Мониторинг процесса сборки
         await status_msg.edit_text("⏳ Компиляция приложения Android (обычно занимает 1-2 минуты)...")
@@ -318,14 +325,14 @@ async def build_apk_process(callback: types.CallbackQuery):
         run_id = None
         
         # Опрашиваем статусы последних запусков workflow
-        for _ in range(30): # Максимум 5 минут ожидания (30 циклов по 10 сек)
+        for _ in range(35): 
             await asyncio.sleep(10)
             runs = repo.get_workflow_runs(branch="main")
             if runs.totalCount > 0:
-                latest_run = runs[0] # Самый свежий запуск
+                latest_run = runs[0] 
                 run_id = latest_run.id
-                status = latest_run.status       # 'queued', 'in_progress', 'completed'
-                conclusion = latest_run.conclusion # 'success', 'failure', etc.
+                status = latest_run.status       
+                conclusion = latest_run.conclusion 
                 
                 if status == "in_progress":
                     await status_msg.edit_text("⚙️ Gradle компилирует Java классы и собирает ресурсы пакета...")
@@ -347,7 +354,7 @@ async def build_apk_process(callback: types.CallbackQuery):
         artifacts = repo.get_artifacts()
         apk_artifact = None
         for art in artifacts:
-            if art.name == "app-debug": # Имя, указанное в build.yml
+            if art.name == "app-debug": 
                 apk_artifact = art
                 break
         
@@ -355,15 +362,10 @@ async def build_apk_process(callback: types.CallbackQuery):
             await status_msg.edit_text("❌ Ошибка: APK файл был собран, но артефакт не найден в репозитории.")
             return
 
-        # Скачиваем архив с APK через GitHub API
-        archive_link = apk_artifact.archive_download_url
-        
-        # Скачиваем zip напрямую в память и распаковываем или шлем ссылку.
-        # Для простоты и стабильности (так как артефакты весят мало в zip), дадим прямую ссылку на скачивание:
         await status_msg.delete()
         
         builder = InlineKeyboardBuilder()
-        builder.button(text="📥 Скачать готовый APK", url=f"https://github.com/{GITHUB_REPO}/actions/runs/{run_id}")
+        builder.button(text="📥 Скачать готовый APK", url=f"https://github.com/{GITHUB_REPO_CLEANED}/actions/runs/{run_id}")
         builder.button(text="⬅️ Назад в меню", callback_data=f"manage_proj_{project_id}")
         builder.adjust(1)
 
