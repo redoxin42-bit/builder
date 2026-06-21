@@ -1,5 +1,8 @@
 import os
+import io
+import zipfile
 import asyncio
+import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -9,7 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BufferedInputFile
 from supabase import create_client, Client
 from aiohttp import web
-from github import Github  # Библиотека для работы с GitHub API
+from github import Github
 
 # 1. ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 load_dotenv()
@@ -20,8 +23,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 
-# 🛠 БРОНЕБОЙНЫЙ ПАРСЕР ССЫЛКИ РЕПОЗИТОРИЯ
-# Вырезает "логин/репозиторий" из абсолютно любого формата, введенного на Render
+# 🛠 ПАРСЕР ССЫЛКИ РЕПОЗИТОРИЯ
 raw_repo = os.getenv("GITHUB_REPO", "").strip()
 raw_repo = raw_repo.replace("https://", "").replace("http://", "").replace("github.com/", "")
 if raw_repo.endswith("/"):
@@ -29,7 +31,6 @@ if raw_repo.endswith("/"):
 
 GITHUB_REPO_CLEANED = raw_repo
 
-# Проверка критических данных
 if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO_CLEANED]):
     print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи Supabase и GitHub в Environment!")
     exit(1)
@@ -40,7 +41,7 @@ github_client = Github(GITHUB_TOKEN)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния FSM для пошагового ввода данных
+# Состояния FSM для пошагового ввода данных (Создание проектов и файлов)
 class ProjectStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_file_name = State()
@@ -119,6 +120,18 @@ def create_project(user_id: int, project_name: str):
         print(f"Database Error (create_project): {e}")
         return None, str(e)
 
+def add_custom_file(project_id: int, file_name: str, content: str):
+    try:
+        supabase.table("files").insert({
+            "project_id": project_id,
+            "name": file_name,
+            "content": content
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"Database Error (add_custom_file): {e}")
+        return False
+
 def get_project_files(project_id: int):
     try:
         res = supabase.table("files").select("*").eq("project_id", project_id).execute()
@@ -136,7 +149,7 @@ def get_file_content(file_id: int):
         return None
 
 # ─────────────────────────────────────────────────────────
-# ⌨️ БЛОК 2: ГЕНЕРАЦИЯ ИНТЕРФЕЙСА (КЛАВИАТУРЫ)
+# ⌨️ БЛОК 2: КЛАВИАТУРЫ И ИНТЕРФЕЙС
 # ─────────────────────────────────────────────────────────
 
 def get_main_menu():
@@ -181,6 +194,7 @@ def get_files_keyboard(project_id: int, files):
     builder = InlineKeyboardBuilder()
     for f in files:
         builder.button(text=f"📄 {f['name']}", callback_data=f"view_file_{f['id']}_{project_id}")
+    builder.button(text="➕ Добавить свой файл", callback_data=f"add_file_{project_id}")
     builder.button(text="⬅️ Назад в управление", callback_data=f"manage_proj_{project_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -191,14 +205,14 @@ def get_file_view_keyboard(project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ И СБОРКА APK С ДИАГНОСТИКОЙ И ОБТЕКАНИЕМ ОШИБОК
+# 📡 БЛОК 3: ХЕНДЛЕРЫ И УПРАВЛЕНИЕ СБОРКОЙ
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        f"Привет, {message.from_user.full_name}! 👋\nСреда разработки FlareBuilder подключена к компилятору.",
+        f"Привет, {message.from_user.full_name}! 👋\nДобро пожаловать в мобильную IDE FlareBuilder.",
         reply_markup=get_main_menu()
     )
 
@@ -218,7 +232,7 @@ async def list_projects(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "new_project")
 async def create_project_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите название проекта (английскими буквами):")
+    await callback.message.edit_text("Введите название нового Java-проекта (английскими буквами):")
     await state.set_state(ProjectStates.waiting_for_name)
 
 @dp.message(ProjectStates.waiting_for_name)
@@ -236,6 +250,39 @@ async def create_project_save(message: types.Message, state: FSMContext):
     else:
         await message.answer(f"❌ Ошибка базы данных:\n`{err_msg}`", reply_markup=get_main_menu())
 
+# ➕ ДОБАВЛЕНИЕ НОВОГО ПОЛЬЗОВАТЕЛЬСКОГО ФАЙЛА (IDE РАСШИРЕНИЕ)
+@dp.callback_query(F.data.startswith("add_file_"))
+async def start_add_file(callback: types.CallbackQuery, state: FSMContext):
+    project_id = int(callback.data.split("_")[2])
+    await state.update_data(current_project_id=project_id)
+    await callback.message.answer("✏️ Введи имя файла вместе с расширением (например, `MyUtils.java` или `SecondActivity.java`):")
+    await state.set_state(ProjectStates.waiting_for_file_name)
+
+@dp.message(ProjectStates.waiting_for_file_name)
+async def save_file_name(message: types.Message, state: FSMContext):
+    file_name = message.text.strip()
+    if not (file_name.endswith(".java") or file_name.endswith(".xml")):
+        await message.answer("❌ Поддерживаются только файлы `.java` или `.xml`. Введи имя заново:")
+        return
+    await state.update_data(chosen_file_name=file_name)
+    await message.answer(f"📝 Отлично! Теперь отправь мне чистый код для файла `{file_name}` одним сообщением:")
+    await state.set_state(ProjectStates.waiting_for_file_content)
+
+@dp.message(ProjectStates.waiting_for_file_content)
+async def save_file_content(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    project_id = user_data['current_project_id']
+    file_name = user_data['chosen_file_name']
+    file_content = message.text
+    
+    success = add_custom_file(project_id, file_name, file_content)
+    await state.clear()
+    
+    if success:
+        await message.answer(f"✅ Файл `{file_name}` успешно сохранен в архитектуру проекта!", reply_markup=get_project_manage_menu(project_id))
+    else:
+        await message.answer("❌ Произошла ошибка записи файла в базу данных.", reply_markup=get_project_manage_menu(project_id))
+
 @dp.callback_query(F.data.startswith("manage_proj_"))
 async def manage_project(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -252,7 +299,9 @@ async def view_architecture(callback: types.CallbackQuery):
     
     tree = f"📦 **{proj['name']}**\n ┗ 📂 app\n ┃ ┗ 📂 src/main\n ┃ ┃ ┣ 📂 java/com/flare/compiler\n"
     for f in files:
-        if f['name'].endswith('.java'): tree += f" ┃ ┃ ┃ ┗ 📄 {f['name']}\n"
+        if f['name'].endswith('.java'): 
+            tree += f" ┃ ┃ ┃ ┗ 📄 {f['name']}\n"
+    tree += " ┃ ┃ ┗ 📂 res (ресурсы проекта)\n"
     tree += " ┃ ┃ ┗ 📄 AndroidManifest.xml"
 
     await callback.message.edit_text(f"⚙️ **Архитектура проекта:**\n```text\n{tree}\n```", parse_mode="Markdown", reply_markup=get_architecture_menu(project_id))
@@ -271,66 +320,50 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{file_data['name']}`\n```java\n{file_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(project_id))
 
-# ХЕНДЛЕР СБОРКИ С УЛУЧШЕННОЙ ОБРАБОТКОЙ ОШИБОК И ФОРМАТОВ ССЫЛОК
+# 🔥 МОЩНЫЙ КОМПИЛЯТОР: ОПТИМИЗИРОВАННАЯ СБОРКА И ЗАГРУЗКА APK НАПРЯМУЮ
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
     proj = get_project_by_id(project_id)
     files = get_project_files(project_id)
     
-    status_msg = await callback.message.answer("📡 Шаг 1: Подключение к GitHub Actions...")
+    status_msg = await callback.message.answer("📡 Шаг 1: Инициализация окружения GitHub API...")
 
     try:
-        manifest_content = next((f['content'] for f in files if f['name'] == "AndroidManifest.xml"), None)
-        java_content = next((f['content'] for f in files if f['name'] == "MainActivity.java"), None)
-
-        if not manifest_content or not java_content:
-            await status_msg.edit_text("❌ Ошибка: В базе Supabase нет базовых файлов кода.")
-            return
-
-        # ЭТАП 1: ПОЛУЧЕНИЕ РЕПОЗИТОРИЯ
+        # Получаем репозиторий
         try:
             repo = github_client.get_repo(GITHUB_REPO_CLEANED)
         except Exception as e_repo:
-            await status_msg.edit_text(
-                f"❌ Ошибка на этапе поиска репозитория `{GITHUB_REPO_CLEANED}`:\n`{str(e_repo)}` \n\n"
-                f"Проверь настройки твоего Personal Access Token на GitHub! Если это Fine-grained токен, "
-                f"убедись, что в пункте Repository Access выбран именно этот репозиторий."
-            )
+            await status_msg.edit_text(f"❌ Ошибка подключения к репозиторию:\n`{str(e_repo)}`")
             return
 
-        await status_msg.edit_text("📝 Шаг 2: Загрузка Манифеста на GitHub...")
+        await status_msg.edit_text("📝 Шаг 2: Синхронизация пользовательского кода с веткой компилятора...")
         
-        # ЭТАП 2: МАНИФЕСТ
-        try:
-            manifest_file = repo.get_contents("app/src/main/AndroidManifest.xml", ref="main")
-            repo.update_file(manifest_file.path, "Update Manifest from Bot", manifest_content, manifest_file.sha, branch="main")
-        except Exception:
+        # Перебираем все файлы из Supabase и отправляем их на GitHub в правильные пути
+        for f in files:
+            name = f['name']
+            content = f['content']
+            
+            if name == "AndroidManifest.xml":
+                path = "app/src/main/AndroidManifest.xml"
+            elif name.endswith(".java"):
+                path = f"app/src/main/java/com/flare/compiler/{name}"
+            else:
+                path = f"app/src/main/{name}" # Для прочих файлов конфигураций
+                
             try:
-                repo.create_file("app/src/main/AndroidManifest.xml", "Create Manifest from Bot", manifest_content, branch="main")
-            except Exception as e_man:
-                await status_msg.edit_text(f"❌ Не удалось записать AndroidManifest.xml:\n`{str(e_man)}`")
-                return
+                git_file = repo.get_contents(path, ref="main")
+                repo.update_file(git_file.path, f"Update {name} from Bot IDE", content, git_file.sha, branch="main")
+            except Exception:
+                repo.create_file(path, f"Create {name} from Bot IDE", content, branch="main")
 
-        await status_msg.edit_text("📝 Шаг 3: Загрузка Java кода на GitHub...")
-
-        # ЭТАП 3: JAVA ФАЙЛ
-        try:
-            java_file = repo.get_contents("app/src/main/java/com/flare/compiler/MainActivity.java", ref="main")
-            repo.update_file(java_file.path, "Update Java Code from Bot", java_content, java_file.sha, branch="main")
-        except Exception:
-            try:
-                repo.create_file("app/src/main/java/com/flare/compiler/MainActivity.java", "Create Java Code from Bot", java_content, branch="main")
-            except Exception as e_jav:
-                await status_msg.edit_text(f"❌ Не удалось записать MainActivity.java:\n`{str(e_jav)}`")
-                return
-
-        await status_msg.edit_text("🚀 Шаг 4: Запуск Gradle сборки...")
-        await asyncio.sleep(6) 
+        await status_msg.edit_text("🚀 Шаг 3: Запуск удаленного Gradle демона...")
+        await asyncio.sleep(5) 
         
         success_build = False
         run_id = None
         
+        # Мониторинг выполнения сборки Gradle (350 секунд таймаут)
         for _ in range(35): 
             await asyncio.sleep(10)
             try:
@@ -342,55 +375,66 @@ async def build_apk_process(callback: types.CallbackQuery):
                     conclusion = latest_run.conclusion 
                     
                     if status == "in_progress":
-                        await status_msg.edit_text("⚙️ Gradle компилирует приложение в облаке...")
+                        await status_msg.edit_text("⚙️ Gradle компилирует файлы приложения в `.apk`...")
                     elif status == "completed":
                         if conclusion == "success":
                             success_build = True
                             break
                         else:
-                            await status_msg.edit_text("❌ Ошибка компиляции Gradle на GitHub Actions!")
+                            await status_msg.edit_text("❌ Ошибка сборки Gradle! Проверь синтаксис своего Java кода.")
                             return
             except Exception:
                 pass
 
         if not success_build or not run_id:
-            await status_msg.edit_text("❌ Время ожидания сборки истекло.")
+            await status_msg.edit_text("❌ Слишком долгая компиляция. Время ожидания истекло.")
             return
 
-        await status_msg.edit_text("📦 Шаг 5: Получение готового APK...")
+        await status_msg.edit_text("📥 Шаг 4: Захват бинарного артефакта и загрузка в Telegram...")
         
         try:
             artifacts = repo.get_artifacts()
             apk_artifact = None
             for art in artifacts:
-                if art.name == "app-debug": 
+                if "app" in art.name.lower() or "debug" in art.name.lower(): 
                     apk_artifact = art
                     break
             
             if not apk_artifact:
-                await status_msg.edit_text("❌ Сборка завершена, но артефакт 'app-debug' не найден.")
+                await status_msg.edit_text("❌ Артефакт сборки сформирован, но не обнаружен API-клиентом.")
                 return
+                
+            # СКАЧИВАНИЕ И РАСПАКОВКА АРТЕФАКТА НАПРЯМУЮ ЧЕРЕЗ BOT-SERVER
+            headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+            download_url = apk_artifact.archive_download_url
+            
+            # Загружаем zip в оперативную память
+            response = requests.get(download_url, headers=headers)
+            if response.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+                    # Ищем внутри архива наш скомпилированный .apk
+                    for file_info in zip_file.infolist():
+                        if file_info.filename.endswith(".apk"):
+                            apk_data = zip_file.read(file_info.filename)
+                            
+                            # Удаляем лог-сообщение и шлем готовый файл
+                            await status_msg.delete()
+                            
+                            input_file = BufferedInputFile(apk_data, filename=f"{proj['name']}-release.apk")
+                            await callback.message.answer_document(
+                                document=input_file,
+                                caption=f"📱 **Твое приложение успешно скомпилировано!**\n\n📦 Проект: `{proj['name']}`\n🔥 Установи этот `.apk` файл на свой Android смартфон прямо сейчас!"
+                            )
+                            return
+                await status_msg.edit_text("❌ Ошибка распаковки архива артефакта.")
+            else:
+                await status_msg.edit_text(f"❌ Ошибка скачивания артефакта с серверов GitHub. Код: {response.status_code}")
+                
         except Exception as e_art:
-            await status_msg.edit_text(f"❌ Ошибка получения артефактов:\n`{str(e_art)}`")
-            return
-
-        await status_msg.delete()
-        
-        builder = InlineKeyboardBuilder()
-        builder.button(text="📥 Скачать готовый APK", url=f"https://github.com/{GITHUB_REPO_CLEANED}/actions/runs/{run_id}")
-        builder.button(text="⬅️ Назад в меню", callback_data=f"manage_proj_{project_id}")
-        builder.adjust(1)
-
-        await callback.message.answer(
-            f"📦 **Ваше настоящее Android-приложение успешно собрано!**\n\n"
-            f"📱 Проект: `{proj['name']}`\n"
-            f"GitHub заархивировал ваш `.apk`. Нажмите кнопку ниже, пролистайте страницу вниз до раздела **Artifacts** и скачайте файл `app-debug`!",
-            parse_mode="Markdown",
-            reply_markup=builder.as_markup()
-        )
+            await status_msg.edit_text(f"❌ Критический сбой загрузки файла: {str(e_art)}")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Общая критическая ошибка:\n`{str(e)}`")
+        await status_msg.edit_text(f"❌ Общая критическая ошибка среды:\n`{str(e)}`")
 
 # ─────────────────────────────────────────────────────────
 # 🌍 БЛОК 4: ВЕБ-СЕРВЕР И СТАРТ СИСТЕМЫ
@@ -405,7 +449,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("🤖 Среда FlareBuilder запущена!")
+    print("🤖 Среда FlareBuilder IDE запущена!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
