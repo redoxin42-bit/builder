@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import zipfile
 import asyncio
 import aiohttp
@@ -24,13 +25,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
-# 🛠 ПАРСЕР ССЫЛКИ СБОРЩИКА
+# 🛠 ПАРСЕР ССЫЛКИ СБОРЩИКА В ОКРУЖЕНИИ
 raw_repo = os.getenv("GITHUB_REPO", "").strip()
-raw_repo = raw_repo.replace("https://", "").replace("http://", "").replace("github.com/", "")
-if raw_repo.endswith("/"):
-    raw_repo = raw_repo[:-1]
-
-GITHUB_REPO_CLEANED = raw_repo
+raw_repo = re.sub(r'^(https?://)?(www\.)?github\.com/', '', raw_repo, flags=re.IGNORECASE)
+GITHUB_REPO_CLEANED = raw_repo.strip('/')
 
 if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO_CLEANED]):
     print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи окружения в Environment!")
@@ -191,7 +189,6 @@ def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="📁 Мои проекты", callback_data="list_projects"))
     builder.add(InlineKeyboardButton(text="📥 Импортировать репозиторий", callback_data="import_repo_start"))
-    # Нативно зелёная кнопка благодаря обновлению Bot API 9.4 (style="success")
     builder.add(InlineKeyboardButton(text="🚀 Забилдить APK", callback_data="fast_build_select", style="success"))
     builder.adjust(1, 2)
     return builder.as_markup()
@@ -214,7 +211,7 @@ def get_file_view_keyboard(file_id: int, project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ ЛОГИКИ И ИМПОРТА ЧЕРЕЗ ZIP
+# 📡 БЛОК 3: ХЕНДЛЕРЫ ЛОГИКИ И УЛУЧШЕННЫЙ ИМПОРТ ЧЕРЕЗ REGEX
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -261,23 +258,31 @@ async def np_save(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "import_repo_start")
 async def import_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📥 Отправь мне ссылку на GitHub репозиторий для импорта и полной Kotlin-модернизации:")
+    await callback.message.edit_text("📥 Отправь мне ссылку на GitHub репозиторий для импорта (можно прямо с командой `git clone`):")
     await state.set_state(ProjectStates.waiting_for_import_url)
 
 @dp.message(ProjectStates.waiting_for_import_url)
 async def import_process(message: types.Message, state: FSMContext):
-    url = message.text.strip()
+    raw_input = message.text.strip()
     
-    if url.endswith(".git"):
-        url = url[:-4]
-    if url.endswith("/"):
-        url = url[:-1]
-        
-    cleaned_path = url.replace("https://", "").replace("http://", "").replace("[github.com/](https://github.com/)", "")
-    parts = cleaned_path.split("/")
+    # ⚡️ Ультимативный Regex-парсер ссылки
+    # Удаляет 'git clone ', 'https://', 'http://', 'www.' вне зависимости от регистра
+    cleaned = re.sub(r'^(git clone\s+)?(https?://)?(www\.)?', '', raw_input, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\.git$', '', cleaned, flags=re.IGNORECASE)  # Срезает расширение .git в конце
+    cleaned = cleaned.strip('/')
+    cleaned = re.sub(r'^github\.com/', '', cleaned, flags=re.IGNORECASE)  # Срезает сам домен
+    
+    # Разбиваем оставшийся путь на сегменты
+    parts = [p for p in cleaned.split('/') if p]
     
     if len(parts) < 2:
-        await message.answer("❌ Неверный формат ссылки. Отправьте ссылку вида: `https://github.com/автор/репозиторий`", parse_mode="Markdown")
+        await message.answer(
+            "❌ **Неверный формат ссылки.**\n\n"
+            "Вы указали только имя автора/организации, но забыли название самого репозитория.\n"
+            "Вышлите ссылку в формате: `https://github.com/Автор/Репозиторий` или просто `Автор/Репозиторий`.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu()
+        )
         await state.clear()
         return
         
@@ -291,7 +296,7 @@ async def import_process(message: types.Message, state: FSMContext):
         async with aiohttp.ClientSession() as session:
             async with session.get(zip_url) as resp:
                 if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Ошибка загрузки ({resp.status}). Проверьте, что репозиторий открытый.")
+                    await status_msg.edit_text(f"❌ Ошибка загрузки ({resp.status}). Проверьте, что репозиторий существует и является открытым.")
                     await state.clear()
                     return
                 zip_data = await resp.read()
@@ -319,7 +324,7 @@ async def import_process(message: types.Message, state: FSMContext):
                         pass
                         
         if not files_to_insert:
-            await status_msg.edit_text("❌ Внутри репозитория не найдено пригодных исходников (.java, .kt, .xml).")
+            await status_msg.edit_text("❌ Внутри репозитория не найдено пригодных Android исходников (.java, .kt, .xml).")
             await state.clear()
             return
             
