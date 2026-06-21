@@ -1,9 +1,14 @@
 import os
 import io
 import re
+import json
 import zipfile
 import asyncio
 import aiohttp
+import subprocess
+import tempfile
+import shutil
+import urllib.parse
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -25,7 +30,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
-# 🛠 ПАРСЕР ССЫЛКИ СБОРЩИКА В ОКРУЖЕНИИ
+# Сборщик чистого имени репозитория для компиляции
 raw_repo = os.getenv("GITHUB_REPO", "").strip()
 raw_repo = re.sub(r'^(https?://)?(www\.)?github\.com/', '', raw_repo, flags=re.IGNORECASE)
 GITHUB_REPO_CLEANED = raw_repo.strip('/')
@@ -42,66 +47,56 @@ dp = Dispatcher()
 
 class ProjectStates(StatesGroup):
     waiting_for_name = State()
-    waiting_for_file_name = State()
-    waiting_for_file_content = State()
     waiting_for_import_url = State()
-    waiting_for_ai_prompt = State()
+    waiting_for_ai_project_prompt = State()
+    waiting_for_file_path = State()
     waiting_for_manual_edit = State()
 
 # ─────────────────────────────────────────────────────────
-# 🧠 БЛОК ИИ: GOOGLE AI STUDIO (GEMINI API)
+# 🧠 МОЩНЫЙ БЛОК ИИ: МУЛЬТИ-ФАЙЛОВАЯ АРХИТЕКТУРА ЧЕРЕЗ JSON
 # ─────────────────────────────────────────────────────────
 
-async def ai_java_to_kotlin(java_code: str) -> str:
-    """Конвертирует Java-код в чистый Kotlin через Gemini API"""
+async def ai_project_wide_develop(files_list: list, user_request: str) -> list:
+    """Передаёт весь проект в Gemini и получает список новых/изменённых файлов в JSON формате"""
     if not GEMINI_API_KEY:
-        return "// AI_ERROR: Ключ GEMINI_API_KEY не задан в окружении"
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    prompt = (
-        "Convert the following Java Android code into fully compatible and modern Kotlin code. "
-        "Return ONLY the pure Kotlin code. Do NOT wrap it in markdown formatting like ```kotlin or ```, "
-        "and do NOT provide any explanations or notes.\n\n"
-        f"Java Code:\n{java_code}"
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    text = data['candidates'][0]['content']['parts'][0]['text']
-                    return text.replace("```kotlin", "").replace("```", "").strip()
-                else:
-                    return f"// AI_ERROR: Gemini API returned status {resp.status}"
-    except Exception as e:
-        return f"// AI_ERROR: {str(e)}"
-
-async def ai_modify_code(current_code: str, user_request: str) -> str:
-    """Модифицирует существующий код по запросу пользователя"""
-    if not GEMINI_API_KEY:
-        return current_code
+        return []
         
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    prompt = (
-        "You are an expert Android Developer. Modify the provided source code based strictly on the user's request. "
-        "Return ONLY the updated valid code. Do NOT wrap it in markdown code blocks, do not explain changes.\n\n"
-        f"User Request: {user_request}\n\n"
-        f"Original Source Code:\n{current_code}"
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     
+    # Собираем контекст текущих файлов
+    context = "Текущая структура и файлы проекта:\n"
+    for f in files_list:
+        context += f"--- ФАЙЛ: {f['name']} ---\n{f['content']}\n\n"
+        
+    prompt = (
+        f"{context}\n"
+        f"Задача от пользователя: {user_request}\n\n"
+        "Ты — ведущий Android-разработчик. Тебе необходимо выполнить задачу пользователя. "
+        "Ты можешь изменять существующие файлы или СОЗДАВАТЬ новые файлы по любым путям (если папок нет, они создадутся). "
+        "Возвращай ТОЛЬКО валидный массив JSON объектов, содержащий файлы, которые нужно создать или изменить. "
+        "Не измененные файлы включать в массив не нужно. Не оборачивай ответ в markdown разметку вроде ```json или ```.\n"
+        "Пример формата ответа:\n"
+        "[\n"
+        "  {\n"
+        "    \"path\": \"app/src/main/kotlin/com/flare/compiler/ui/SettingsActivity.kt\",\n"
+        "    \"content\": \"package com.flare.compiler.ui\\n\\n...код...\"\n"
+        "  }\n"
+        "]"
+    )
+    
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    text = data['candidates'][0]['content']['parts'][0]['text']
-                    return text.replace("```kotlin", "").replace("```", "").replace("```xml", "").strip()
-    except Exception:
-        pass
-    return current_code
+                    raw_text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    # Чистим случайные маркдаун-теги от ИИ
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    return json.loads(raw_text)
+    except Exception as e:
+        print(f"Ошибка ИИ-архитектора: {e}")
+    return []
 
 # ─────────────────────────────────────────────────────────
 # 🔥 БЛОК 1: РАБОТА С БАЗОЙ ДАННЫХ (SUPABASE)
@@ -111,26 +106,27 @@ def get_user_projects(user_id: int):
     try:
         res = supabase.table("projects").select("*").eq("user_id", user_id).execute()
         return res.data
-    except Exception:
-        return []
+    except Exception: return []
 
 def get_project_by_id(project_id: int):
     try:
         res = supabase.table("projects").select("*").eq("id", project_id).execute()
         return res.data[0] if res.data else None
-    except Exception:
-        return None
+    except Exception: return None
 
 def create_project(user_id: int, project_name: str):
     try:
         proj_res = supabase.table("projects").insert({"user_id": user_id, "name": project_name}).execute()
-        if not proj_res.data:
-            return None, "Ответ БД пуст."
+        if not proj_res.data: return None, "БД вернула пустой ответ."
         project_id = proj_res.data[0]["id"]
+
+        # Создаем файлы сразу с правильными путями
+        manifest_path = "app/src/main/AndroidManifest.xml"
+        kotlin_path = "app/src/main/kotlin/com/flare/compiler/MainActivity.kt"
 
         manifest_code = (
             '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<manifest xmlns:android="[http://schemas.android.com/apk/res/android](http://schemas.android.com/apk/res/android)"\n'
+            '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
             '    package="com.flare.compiler">\n'
             '    <application android:label="FlareApp">\n'
             '        <activity android:name=".MainActivity" android:exported="true">\n'
@@ -142,7 +138,6 @@ def create_project(user_id: int, project_name: str):
             '    </application>\n'
             '</manifest>'
         )
-        
         kotlin_code = (
             "package com.flare.compiler\n\n"
             "import android.os.Bundle\n"
@@ -152,51 +147,41 @@ def create_project(user_id: int, project_name: str):
             "    override fun onCreate(savedInstanceState: Bundle?) {\n"
             "        super.onCreate(savedInstanceState)\n"
             "        val textView = TextView(this)\n"
-            "        textView.text = \"Hello World from FlareBuilder Kotlin IDE!\"\n"
+            "        textView.text = \"Hello World from FlareBuilder!\"\n"
             "        setContentView(textView)\n"
             "    }\n"
             "}"
         )
 
         supabase.table("files").insert([
-            {"project_id": project_id, "name": "AndroidManifest.xml", "content": manifest_code},
-            {"project_id": project_id, "name": "MainActivity.kt", "content": kotlin_code}
+            {"project_id": project_id, "name": manifest_path, "content": manifest_code},
+            {"project_id": project_id, "name": kotlin_path, "content": kotlin_code}
         ]).execute()
         
         return project_id, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
 def get_project_files(project_id: int):
     try:
         res = supabase.table("files").select("*").eq("project_id", project_id).execute()
         return res.data
-    except Exception:
-        return []
-
-def update_file_content(file_id: int, content: str):
-    try:
-        supabase.table("files").update({"content": content}).eq("id", file_id).execute()
-        return True
-    except Exception:
-        return False
+    except Exception: return []
 
 # ─────────────────────────────────────────────────────────
-# ⌨️ БЛОК 2: КЛАВИАТУРЫ И СТИЛИ КНОПОК ПО BOT API 9.4
+# ⌨️ БЛОК 2: КЛАВИАТУРЫ И СТИЛИ КНОПОК
 # ─────────────────────────────────────────────────────────
 
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="📁 Мои проекты", callback_data="list_projects"))
-    builder.add(InlineKeyboardButton(text="📥 Импортировать репозиторий", callback_data="import_repo_start"))
-    builder.add(InlineKeyboardButton(text="🚀 Забилдить APK", callback_data="fast_build_select", style="success"))
-    builder.adjust(1, 2)
+    builder.add(InlineKeyboardButton(text="📥 Импортировать через Git Clone", callback_data="import_repo_start"))
+    builder.adjust(1)
     return builder.as_markup()
 
 def get_project_manage_menu(project_id: int):
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="🏗 Архитектура папок", callback_data=f"arch_proj_{project_id}"))
-    builder.add(InlineKeyboardButton(text="📄 Список файлов (Код)", callback_data=f"files_proj_{project_id}"))
+    builder.add(InlineKeyboardButton(text="🗂 Проводник файлов (Код)", callback_data=f"files_proj_{project_id}"))
+    builder.add(InlineKeyboardButton(text="🤖 AI Проектирование (Создание/Правка)", callback_data=f"project_ai_dev_{project_id}", style="primary"))
     builder.add(InlineKeyboardButton(text="🚀 Собрать APK-пакет", callback_data=f"build_apk_{project_id}", style="success"))
     builder.add(InlineKeyboardButton(text="⬅️ К списку проектов", callback_data="list_projects", style="danger"))
     builder.adjust(1)
@@ -205,42 +190,40 @@ def get_project_manage_menu(project_id: int):
 def get_file_view_keyboard(file_id: int, project_id: int):
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text="✏️ Изменить вручную", callback_data=f"edit_man_{file_id}_{project_id}", style="primary"))
-    builder.add(InlineKeyboardButton(text="🤖 Оптимизировать через AI", callback_data=f"edit_ai_{file_id}_{project_id}", style="success"))
-    builder.add(InlineKeyboardButton(text="⬅️ К списку файлов", callback_data=f"files_proj_{project_id}", style="danger"))
-    builder.adjust(2, 1)
+    builder.add(InlineKeyboardButton(text="⬅️ Назад в проводник", callback_data=f"files_proj_{project_id}", style="danger"))
+    builder.adjust(1)
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ ЛОГИКИ И УЛУЧШЕННЫЙ ИМПОРТ ЧЕРЕЗ REGEX
+# 📡 БЛОК 3: ХЕНДЛЕРЫ ЛОГИКИ И СИСТЕМНЫЙ GIT CLONE
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("🛸 **Мобильная Среда Разработки FlareBuilder Kotlin IDE**", reply_markup=get_main_menu(), parse_mode="Markdown")
+    await message.answer("🛸 **FlareBuilder Kotlin IDE** готова к работе.", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "list_projects")
 async def list_projects(callback: types.CallbackQuery):
     projects = get_user_projects(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
     if not projects:
-        builder = InlineKeyboardBuilder()
-        builder.add(InlineKeyboardButton(text="➕ Создать проект", callback_data="new_project_start", style="success"))
+        builder.add(InlineKeyboardButton(text="➕ Создать новый проект", callback_data="new_project_start", style="success"))
         builder.add(InlineKeyboardButton(text="⬅️ Меню", callback_data="main_menu", style="danger"))
         builder.adjust(1)
-        await callback.message.edit_text("У вас нет проектов.", reply_markup=builder.as_markup())
+        await callback.message.edit_text("У вас пока нет созданных проектов.", reply_markup=builder.as_markup())
     else:
-        builder = InlineKeyboardBuilder()
         for p in projects:
             builder.add(InlineKeyboardButton(text=f"📦 {p['name']}", callback_data=f"manage_proj_{p['id']}"))
-        builder.add(InlineKeyboardButton(text="➕ Создать проект", callback_data="new_project_start", style="success"))
-        builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu", style="danger"))
+        builder.add(InlineKeyboardButton(text="➕ Создать новый проект", callback_data="new_project_start", style="success"))
+        builder.add(InlineKeyboardButton(text="⬅️ Меню", callback_data="main_menu", style="danger"))
         builder.adjust(1)
-        await callback.message.edit_text("Выбери проект:", reply_markup=builder.as_markup())
+        await callback.message.edit_text("Выберите проект для работы:", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("🛸 **Мобильная Среда Разработки FlareBuilder Kotlin IDE**", reply_markup=get_main_menu(), parse_mode="Markdown")
+    await callback.message.edit_text("🛸 **FlareBuilder Kotlin IDE** готова к работе.", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "new_project_start")
 async def np_start(callback: types.CallbackQuery, state: FSMContext):
@@ -252,149 +235,114 @@ async def np_save(message: types.Message, state: FSMContext):
     pid, err = create_project(message.from_user.id, message.text.strip())
     await state.clear()
     if pid:
-        await message.answer("✅ Проект создан успешно!", reply_markup=get_project_manage_menu(pid))
+        await message.answer("✅ Проект инициализирован!", reply_markup=get_project_manage_menu(pid))
     else:
-         await message.answer(f"❌ Ошибка: {err}", reply_markup=get_main_menu())
+         await message.answer(f"❌ Ошибка создания: {err}", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "import_repo_start")
 async def import_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📥 Отправь мне ссылку на GitHub репозиторий для импорта (можно прямо с командой `git clone`):")
+    await callback.message.edit_text("📥 Отправьте ссылку на GitHub репозиторий. Поддерживается любой формат (даже прямая вставка строки `git clone ...`):")
     await state.set_state(ProjectStates.waiting_for_import_url)
 
 @dp.message(ProjectStates.waiting_for_import_url)
 async def import_process(message: types.Message, state: FSMContext):
-    raw_input = message.text.strip()
+    raw_input = urllib.parse.unquote(message.text.strip())
+    await state.clear()
     
-    # ⚡️ Ультимативный Regex-парсер ссылки
-    # Удаляет 'git clone ', 'https://', 'http://', 'www.' вне зависимости от регистра
-    cleaned = re.sub(r'^(git clone\s+)?(https?://)?(www\.)?', '', raw_input, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\.git$', '', cleaned, flags=re.IGNORECASE)  # Срезает расширение .git в конце
-    cleaned = cleaned.strip('/')
-    cleaned = re.sub(r'^github\.com/', '', cleaned, flags=re.IGNORECASE)  # Срезает сам домен
-    
-    # Разбиваем оставшийся путь на сегменты
-    parts = [p for p in cleaned.split('/') if p]
-    
-    if len(parts) < 2:
-        await message.answer(
-            "❌ **Неверный формат ссылки.**\n\n"
-            "Вы указали только имя автора/организации, но забыли название самого репозитория.\n"
-            "Вышлите ссылку в формате: `https://github.com/Автор/Репозиторий` или просто `Автор/Репозиторий`.",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu()
-        )
-        await state.clear()
-        return
-        
-    owner = parts[0]
-    proj_name = parts[1]
-    
-    status_msg = await message.answer("📥 Выполняю облачный `git clone`: Подключаюсь и скачиваю файлы...")
-    zip_url = f"[https://api.github.com/repos/](https://api.github.com/repos/){owner}/{proj_name}/zipball"
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(zip_url) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Ошибка загрузки ({resp.status}). Проверьте, что репозиторий существует и является открытым.")
-                    await state.clear()
-                    return
-                zip_data = await resp.read()
-                
-        await status_msg.edit_text("🗂 Распаковка структуры файлов и чтение кода...")
-        
-        proj_res = supabase.table("projects").insert({"user_id": message.from_user.id, "name": proj_name}).execute()
-        project_id = proj_res.data[0]["id"]
-        
-        files_to_insert = []
-        
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as archive:
-            for file_info in archive.infolist():
-                if file_info.is_dir() or "/." in file_info.filename:
-                    continue
-                    
-                if file_info.filename.endswith(('.java', '.kt', '.xml')):
-                    filename = os.path.basename(file_info.filename)
-                    if not filename:
-                        continue
-                    try:
-                        content = archive.read(file_info.filename).decode('utf-8', errors='ignore')
-                        files_to_insert.append({"name": filename, "content": content})
-                    except Exception:
-                        pass
-                        
-        if not files_to_insert:
-            await status_msg.edit_text("❌ Внутри репозитория не найдено пригодных Android исходников (.java, .kt, .xml).")
-            await state.clear()
-            return
-            
-        await status_msg.edit_text("🧠 ИИ-Конвертер активирован. Перевожу Java-код на Kotlin...")
-        
-        for f in files_to_insert:
-            name = f['name']
-            content = f['content']
-            
-            if name.endswith(".java"):
-                await status_msg.edit_text(f"🤖 ИИ адаптирует: `{name}` ➔ Kotlin...")
-                content = await ai_java_to_kotlin(content)
-                name = name.replace(".java", ".kt")
-                
-            supabase.table("files").insert({"project_id": project_id, "name": name, "content": content}).execute()
-            
-        await status_msg.delete()
-        await message.answer(f"🚀 Проект `{proj_name}` успешно клонирован и полностью переведён на Kotlin!", reply_markup=get_project_manage_menu(project_id))
-        await state.clear()
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Критический сбой импорта:\n`{str(e)}`", parse_mode="Markdown")
-        await state.clear()
-
-@dp.callback_query(F.data == "fast_build_select")
-async def fbs(callback: types.CallbackQuery):
-    projects = get_user_projects(callback.from_user.id)
-    if not projects:
-         await callback.message.edit_text("У вас нет проектов для сборки.", reply_markup=get_main_menu())
+    # 🛠 УЛЬТИМАТИВНЫЙ ДЕКОДЕР И СБОР ССЫЛКИ ДЛЯ ТЕРМИНАЛА
+    match = re.search(r'github\.com/([^/\s]+)/([^/\s\.]+)', raw_input, re.IGNORECASE)
+    if match:
+        owner, repo_name = match.group(1), match.group(2)
     else:
-        builder = InlineKeyboardBuilder()
-        for p in projects:
-            builder.add(InlineKeyboardButton(text=f"🚀 Собрать {p['name']}", callback_data=f"build_apk_{p['id']}", style="success"))
-        builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu", style="danger"))
-        builder.adjust(1)
-        await callback.message.edit_text("Выбери проект для мгновенного билда:", reply_markup=builder.as_markup())
+        cleaned = re.sub(r'^(git clone\s+)?(https?://)?(www\.)?', '', raw_input, flags=re.IGNORECASE)
+        parts = [p for p in cleaned.split('/') if p]
+        if len(parts) >= 2:
+            owner, repo_name = parts[0], parts[1]
+        else:
+            await message.answer("❌ Не удалось распознать ссылку на репозиторий. Попробуйте скопировать её стандартный вид.", reply_markup=get_main_menu())
+            return
+
+    clone_url = f"https://github.com/{owner}/{repo_name}.git"
+    status_msg = await message.answer(f"🖥 `Terminal:` Выполняю команду `git clone {clone_url}` в изолированном окружении...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            # Запуск терминального клонирования через подпроцесс
+            process = await asyncio.create_subprocess_exec(
+                "git", "clone", "--depth", "1", clone_url, tmpdir,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                await status_msg.edit_text(f"❌ `Terminal Error:` Сбой выполнения клонирования.\nЛог:\n`{stderr.decode(errors='ignore')}`")
+                return
+
+            await status_msg.edit_text("🗂 Сканирование структуры репозитория и сохранение путей...")
+
+            proj_res = supabase.table("projects").insert({"user_id": message.from_user.id, "name": repo_name}).execute()
+            project_id = proj_res.data[0]["id"]
+
+            files_inserted = 0
+            for root, _, files in os.walk(tmpdir):
+                for file in files:
+                    if file.endswith(('.kt', '.java', '.xml')):
+                        full_path = os.path.join(root, file)
+                        # Получаем чистый относительный путь файла в структуре проекта
+                        rel_path = os.path.relpath(full_path, tmpdir)
+                        
+                        try:
+                            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f_content:
+                                content = f_content.read()
+                            
+                            # Сохраняем имя файла прямо как его путь! (напр. app/src/main/res/layout/main.xml)
+                            supabase.table("files").insert({
+                                "project_id": project_id,
+                                "name": rel_path,
+                                "content": content
+                            }).execute()
+                            files_inserted += 1
+                        except Exception:
+                            pass
+
+            await status_msg.delete()
+            if files_inserted > 0:
+                await message.answer(f"🚀 Репозиторий `{repo_name}` успешно импортирован!\nСохранено исходных файлов: {files_inserted}", reply_markup=get_project_manage_menu(project_id))
+            else:
+                await message.answer("⚠ Репозиторий склонирован, но внутри не найдено файлов Android исходников (.kt, .java, .xml).", reply_markup=get_main_menu())
+
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Критический сбой работы окружения: {str(e)}")
 
 @dp.callback_query(F.data.startswith("manage_proj_"))
 async def manage_proj(callback: types.CallbackQuery):
     pid = int(callback.data.split("_")[2])
     p = get_project_by_id(pid)
-    await callback.message.edit_text(f"📦 Управление проектом: **{p['name']}**", reply_markup=get_project_manage_menu(pid), parse_mode="Markdown")
+    await callback.message.edit_text(f"📦 Проект: **{p['name']}**\nВыберите действие:", reply_markup=get_project_manage_menu(pid), parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("arch_proj_"))
-async def arch_proj(callback: types.CallbackQuery):
-    pid = int(callback.data.split("_")[2])
-    p = get_project_by_id(pid)
-    files = get_project_files(pid)
-    
-    tree = f"📦 **{p['name']}**\n ┗ 📂 app\n ┃ ┗ 📂 src/main\n ┃ ┃ ┣ 📂 kotlin/com/flare/compiler\n"
-    for f in files:
-        if f['name'].endswith('.kt'): 
-            tree += f" ┃ ┃ ┃ ┗ 📄 {f['name']}\n"
-    tree += " ┃ ┃ ┣ 📂 res (ресурсы макетов)\n"
-    tree += " ┃ ┃ ┗ 📄 AndroidManifest.xml"
-    
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_proj_{pid}", style="danger"))
-    await callback.message.edit_text(f"⚙️ **Новая Архитектура Папок (Kotlin):**\n```text\n{tree}\n```", parse_mode="Markdown", reply_markup=builder.as_markup())
+# ─────────────────────────────────────────────────────────
+# 📂 СТРУКТУРА ПАПОК НА INLINE-КНОПКАХ (ПРОВОДНИК)
+# ─────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("files_proj_"))
 async def files_proj(callback: types.CallbackQuery):
     pid = int(callback.data.split("_")[2])
     files = get_project_files(pid)
+    
     builder = InlineKeyboardBuilder()
+    if not files:
+        await callback.message.edit_text("В проекте нет файлов. Воспользуйтесь ИИ для их создания.", reply_markup=get_project_manage_menu(pid))
+        return
+        
     for f in files:
+        # Показываем красивую кнопку с относительным путем файла
         builder.add(InlineKeyboardButton(text=f"📄 {f['name']}", callback_data=f"vf_{f['id']}_{pid}"))
-    builder.add(InlineKeyboardButton(text="⬅️ Назад в управление", callback_data=f"manage_proj_{pid}", style="danger"))
+        
+    builder.add(InlineKeyboardButton(text="➕ Создать файл вручную", callback_data=f"add_f_{pid}", style="success"))
+    builder.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_proj_{pid}", style="danger"))
     builder.adjust(1)
-    await callback.message.edit_text("Выбери файл для просмотра или редактирования:", reply_markup=builder.as_markup())
+    
+    await callback.message.edit_text("🗂 **Проводник файлов проекта:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("vf_"))
 async def view_file(callback: types.CallbackQuery):
@@ -407,36 +355,30 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{f_data['name']}`\n```{lang}\n{f_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(fid, pid))
 
-@dp.callback_query(F.data.startswith("edit_ai_"))
-async def edit_ai_start(callback: types.CallbackQuery, state: FSMContext):
-    fid = int(callback.data.split("_")[2])
-    pid = int(callback.data.split("_")[3])
-    await state.update_data(ai_fid=fid, ai_pid=pid)
-    await callback.message.answer("🤖 **Ассистент Gemini.** Напиши текстом, что нужно изменить или добавить в этот файл:")
-    await state.set_state(ProjectStates.waiting_for_ai_prompt)
+@dp.callback_query(F.data.startswith("add_f_"))
+async def add_file_start(callback: types.CallbackQuery, state: FSMContext):
+    pid = int(callback.data.split("_")[2])
+    await state.update_data(create_pid=pid)
+    await callback.message.answer("✍ Введите полный относительный путь для нового файла (например, `app/src/main/res/values/strings.xml`):")
+    await state.set_state(ProjectStates.waiting_for_file_path)
 
-@dp.message(ProjectStates.waiting_for_ai_prompt)
-async def edit_ai_process(message: types.Message, state: FSMContext):
+@dp.message(ProjectStates.waiting_for_file_path)
+async def add_file_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    fid, pid = data['ai_fid'], data['ai_pid']
+    pid = data['create_pid']
+    path = message.text.strip().strip('/')
+    
+    # Создаем пустой файл
+    supabase.table("files").insert({"project_id": pid, "name": path, "content": "// Новый файл"}).execute()
     await state.clear()
-    
-    status_msg = await message.answer("🧠 ИИ переписывает структуру кода...")
-    res = supabase.table("files").select("*").eq("id", fid).execute()
-    current_code = res.data[0]['content']
-    
-    updated_code = await ai_modify_code(current_code, message.text)
-    update_file_content(fid, updated_code)
-    
-    await status_msg.delete()
-    await message.answer("✨ ИИ успешно применил правки к файлу!", reply_markup=get_project_manage_menu(pid))
+    await message.answer(f"✅ Файл `{path}` успешно добавлен в дерево папок!", reply_markup=get_project_manage_menu(pid))
 
 @dp.callback_query(F.data.startswith("edit_man_"))
 async def edit_man_start(callback: types.CallbackQuery, state: FSMContext):
     fid = int(callback.data.split("_")[2])
     pid = int(callback.data.split("_")[3])
     await state.update_data(m_fid=fid, m_pid=pid)
-    await callback.message.answer("✏️ Отправь мне обновленный код для этого файла целиком в одном сообщении:")
+    await callback.message.answer("✏️ Отправьте измененный код для этого файла целиком в одном сообщении:")
     await state.set_state(ProjectStates.waiting_for_manual_edit)
 
 @dp.message(ProjectStates.waiting_for_manual_edit)
@@ -445,8 +387,73 @@ async def edit_man_process(message: types.Message, state: FSMContext):
     fid, pid = data['m_fid'], data['m_pid']
     await state.clear()
     
-    update_file_content(fid, message.text)
-    await message.answer("✅ Файл сохранен!", reply_markup=get_project_manage_menu(pid))
+    supabase.table("files").update({"content": message.text}).eq("id", fid).execute()
+    await message.answer("✅ Изменения в файле успешно сохранены!", reply_markup=get_project_manage_menu(pid))
+
+# ─────────────────────────────────────────────────────────
+# 🤖 АВТОМАТИЧЕСКОЕ ИИ ПРОЕКТИРОВАНИЕ ПАПОК И КОДА
+# ─────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("project_ai_dev_"))
+async def ai_dev_start(callback: types.CallbackQuery, state: FSMContext):
+    pid = int(callback.data.split("_")[3])
+    await state.update_data(ai_pid=pid)
+    await callback.message.answer(
+        "🤖 **Глобальный ИИ-Архитектор проекта**\n\n"
+        "Опишите задачу текстом. ИИ проанализирует текущие файлы и **сам создаст нужные папки/файлы**, "
+        "а также изменит старые в соответствии с вашим запросом."
+    )
+    await state.set_state(ProjectStates.waiting_for_ai_project_prompt)
+
+@dp.message(ProjectStates.waiting_for_ai_project_prompt)
+async def ai_dev_process(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pid = data['ai_pid']
+    await state.clear()
+    
+    status_msg = await message.answer("🧠 ИИ изучает архитектуру проекта и пишет код...")
+    
+    current_files = get_project_files(pid)
+    ai_actions = await ai_project_wide_develop(current_files, message.text.strip())
+    
+    if not ai_actions:
+        await status_msg.edit_text("❌ ИИ не смог сформировать изменения или вернул неверный формат. Попробуйте изменить запрос.")
+        return
+        
+    created_count = 0
+    updated_count = 0
+    
+    for action in ai_actions:
+        target_path = action.get("path", "").strip().strip('/')
+        new_content = action.get("content", "")
+        
+        if not target_path:
+            continue
+            
+        # Проверяем, существует ли файл с таким путем в проекте
+        existing_file = next((f for f in current_files if f['name'] == target_path), None)
+        
+        if existing_file:
+            # Обновляем старый файл
+            supabase.table("files").update({"content": new_content}).eq("id", existing_file['id']).execute()
+            updated_count += 1
+        else:
+            # Создаем новый файл по сгенерированному ИИ пути (папки виртуально создаются путями)
+            supabase.table("files").insert({"project_id": pid, "name": target_path, "content": new_content}).execute()
+            created_count += 1
+            
+    await status_msg.delete()
+    await message.answer(
+        f"✨ **ИИ успешно завершил проектирование!**\n\n"
+        f"📁 Создано новых файлов: `{created_count}`\n"
+        f"📝 Модифицировано файлов: `{updated_count}`",
+        parse_mode="Markdown",
+        reply_markup=get_project_manage_menu(pid)
+    )
+
+# ─────────────────────────────────────────────────────────
+# 🚀 БИЛДЕР ЧЕРЕЗ ДИНАМИЧЕСКИЕ ПУТИ ИЗ БД
+# ─────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
@@ -454,30 +461,23 @@ async def build_apk_process(callback: types.CallbackQuery):
     proj = get_project_by_id(project_id)
     files = get_project_files(project_id)
     
-    status_msg = await callback.message.answer("📡 Шаг 1: Подключение к компилятору GitHub...")
+    status_msg = await callback.message.answer("📡 Шаг 1: Подключение к репозиторию компилятора...")
 
     try:
         repo = github_client.get_repo(GITHUB_REPO_CLEANED)
-        await status_msg.edit_text("📝 Шаг 2: Синхронизация Kotlin исходников...")
+        await status_msg.edit_text("📝 Шаг 2: Синхронизация структуры папок и исходников...")
         
         for f in files:
-            name = f['name']
+            path = f['name']  # Полный путь файла из БД
             content = f['content']
-            
-            if name == "AndroidManifest.xml":
-                path = "app/src/main/AndroidManifest.xml"
-            elif name.endswith(".kt"):
-                path = f"app/src/main/kotlin/com/flare/compiler/{name}"
-            else:
-                path = f"app/src/main/{name}"
                 
             try:
                 git_file = repo.get_contents(path, ref="main")
-                repo.update_file(git_file.path, f"Update {name}", content, git_file.sha, branch="main")
+                repo.update_file(git_file.path, f"Update {path}", content, git_file.sha, branch="main")
             except Exception:
-                repo.create_file(path, f"Create {name}", content, branch="main")
+                repo.create_file(path, f"Create {path}", content, branch="main")
 
-        await status_msg.edit_text("🚀 Шаг 3: Запуск Gradle сборки...")
+        await status_msg.edit_text("🚀 Шаг 3: Запуск удаленной Gradle сборки...")
         await asyncio.sleep(5) 
         
         success_build = False
@@ -491,22 +491,21 @@ async def build_apk_process(callback: types.CallbackQuery):
                     latest_run = runs[0] 
                     run_id = latest_run.id
                     if latest_run.status == "in_progress":
-                        await status_msg.edit_text("⚙️ Gradle компилирует и линкует ресурсы приложения в APK...")
+                        await status_msg.edit_text("⚙️ Gradle компилирует и линкует ресурсы приложения в APK пакет...")
                     elif latest_run.status == "completed":
                         if latest_run.conclusion == "success":
                             success_build = True
                             break
                         else:
-                            await status_msg.edit_text("❌ Ошибка сборки Gradle! Проверь синтаксис Kotlin кода.")
+                            await status_msg.edit_text("❌ Ошибка сборки Gradle! Проверьте синтаксис вашего кода.")
                             return
-            except Exception:
-                pass
+            except Exception: pass
 
         if not success_build or not run_id:
-            await status_msg.edit_text("❌ Время таймаута компиляции истекло.")
+            await status_msg.edit_text("❌ Превышено время ожидания компиляции (Timeout).")
             return
 
-        await status_msg.edit_text("📥 Шаг 4: Скачивание бинарного APK артефакта...")
+        await status_msg.edit_text("📥 Шаг 4: Извлечение готового APK артефакта...")
         
         try:
             import requests
@@ -518,7 +517,7 @@ async def build_apk_process(callback: types.CallbackQuery):
                     break
             
             if not apk_artifact:
-                await status_msg.edit_text("❌ Файл сборки не найден на сервере артефактов.")
+                await status_msg.edit_text("❌ Готовый скомпилированный файл не найден.")
                 return
                 
             headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -533,17 +532,17 @@ async def build_apk_process(callback: types.CallbackQuery):
                             input_file = BufferedInputFile(apk_data, filename=f"{proj['name']}.apk")
                             await callback.message.answer_document(
                                 document=input_file,
-                                caption=f"📱 **Твое Kotlin приложение успешно забилжено!**\n\n📦 Проект: `{proj['name']}`\n🔥 Устанавливай APK прямо из чата!"
+                                caption=f"📱 **Твое приложение успешно собрано!**\n\n📦 Проект: `{proj['name']}`\n🔥 Устанавливай APK прямо сейчас!"
                             )
                             return
-            await status_msg.edit_text("❌ Не удалось извлечь APK из сборочного пакета.")
+            await status_msg.edit_text("❌ Ошибка при распаковке APK пакета.")
         except Exception as e_art:
-            await status_msg.edit_text(f"❌ Критический сбой передачи данных: {str(e_art)}")
+            await status_msg.edit_text(f"❌ Ошибка загрузки артефактов: {str(e_art)}")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Критическая ошибка:\n`{str(e)}`")
+        await status_msg.edit_text(f"❌ Критическая ошибка сборщика:\n`{str(e)}`")
 
 # ─────────────────────────────────────────────────────────
-# 🌍 БЛОК 4: СТАРТ ВЕБ-СЕРВЕРА КЛИЕНТА
+# 🌍 ВЕБ-СЕРВЕР И СТАРТ
 # ─────────────────────────────────────────────────────────
 async def handle_ping(request): return web.Response(text="Бот онлайн!", status=200)
 async def start_web_server():
@@ -555,7 +554,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("🤖 FlareBuilder Kotlin IDE с ИИ Gemini запущена!")
+    print("🤖 FlareBuilder Kotlin IDE успешно запущена!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
