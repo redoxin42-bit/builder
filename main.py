@@ -26,7 +26,7 @@ if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO]):
     print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи Supabase и GitHub в Environment!")
     exit(1)
 
-# Принудительно приводим название репозитория к нижнему регистру для стабильности API гитхаба
+# Очищаем строку репозитория от случайных пробелов
 GITHUB_REPO_CLEANED = GITHUB_REPO.strip()
 
 # Инициализация клиентов
@@ -122,18 +122,6 @@ def get_project_files(project_id: int):
         print(f"Database Error (get_files): {e}")
         return []
 
-def add_custom_file(project_id: int, filename: str, content: str):
-    try:
-        res = supabase.table("files").insert({
-            "project_id": project_id,
-            "name": filename,
-            "content": content
-        }).execute()
-        return res.data
-    except Exception as e:
-        print(f"Database Error (add_custom_file): {e}")
-        return None
-
 def get_file_content(file_id: int):
     try:
         res = supabase.table("files").select("*").eq("id", file_id).execute()
@@ -198,14 +186,14 @@ def get_file_view_keyboard(project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ И НАДЁЖНАЯ СБОРКА APK ЧЕРЕЗ GITHUB
+# 📡 БЛОК 3: ХЕНДЛЕРЫ С ТОЧНОЙ ДИАГНОСТИКОЙ ОШИБОК
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        f"Привет, {message.from_user.full_name}! 👋\nСреда разработки FlareBuilder подключена к облачному Gradle-компилятору.",
+        f"Привет, {message.from_user.full_name}! 👋\nСреда разработки FlareBuilder подключена.",
         reply_markup=get_main_menu()
     )
 
@@ -278,88 +266,103 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{file_data['name']}`\n```java\n{file_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(project_id))
 
-# 🔥 НАДЁЖНЫЙ ХЕНДЛЕР СБОРКИ С ОБХОДОМ ОШИБОК 404
+# 🔥 ХЕНДЛЕР СБОРКИ С ДИАГНОСТИКОЙ ПОЭТАПНО
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
     proj = get_project_by_id(project_id)
     files = get_project_files(project_id)
     
-    status_msg = await callback.message.answer("📡 Подключение к компилятору GitHub Actions...")
+    status_msg = await callback.message.answer("📡 Шаг 1: Подключение к GitHub Actions...")
 
     try:
-        # Извлекаем код из Supabase
         manifest_content = next((f['content'] for f in files if f['name'] == "AndroidManifest.xml"), None)
         java_content = next((f['content'] for f in files if f['name'] == "MainActivity.java"), None)
 
         if not manifest_content or not java_content:
-            await status_msg.edit_text("❌ Ошибка: В базе данных Supabase не найдены исходные файлы Java или Манифеста.")
+            await status_msg.edit_text("❌ Ошибка: В базе Supabase нет базовых файлов кода.")
             return
 
-        # Подключаемся к репозиторию на GitHub
-        repo = github_client.get_repo(GITHUB_REPO_CLEANED)
+        # ЭТАП 1: ПОЛУЧЕНИЕ РЕПОЗИТОРИЯ
+        try:
+            repo = github_client.get_repo(GITHUB_REPO_CLEANED)
+        except Exception as e_repo:
+            await status_msg.edit_text(f"❌ Ошибка на этапе поиска репозитория `{GITHUB_REPO_CLEANED}`:\n`{str(e_repo)}` \n\nПроверь, чтобы токен имел доступ к этому репозиторию!")
+            return
 
-        await status_msg.edit_text("📝 Загрузка исходного кода в репозиторий GitHub...")
+        await status_msg.edit_text("📝 Шаг 2: Загрузка Манифеста на GitHub...")
         
-        # 🛠 БЕЗОПАСНАЯ ПЕРЕЗАПИСЬ / СОЗДАНИЕ МАНИФЕСТА
+        # ЭТАП 2: МАНИФЕСТ
         try:
             manifest_file = repo.get_contents("app/src/main/AndroidManifest.xml", ref="main")
             repo.update_file(manifest_file.path, "Update Manifest from Bot", manifest_content, manifest_file.sha, branch="main")
         except Exception:
-            repo.create_file("app/src/main/AndroidManifest.xml", "Create Manifest from Bot", manifest_content, branch="main")
+            try:
+                repo.create_file("app/src/main/AndroidManifest.xml", "Create Manifest from Bot", manifest_content, branch="main")
+            except Exception as e_man:
+                await status_msg.edit_text(f"❌ Не удалось записать AndroidManifest.xml:\n`{str(e_man)}`")
+                return
 
-        # 🛠 БЕЗОПАСНАЯ ПЕРЕЗАПИСЬ / СОЗДАНИЕ JAVA-КОДА
+        await status_msg.edit_text("📝 Шаг 3: Загрузка Java кода на GitHub...")
+
+        # ЭТАП 3: JAVA ФАЙЛ
         try:
             java_file = repo.get_contents("app/src/main/java/com/flare/compiler/MainActivity.java", ref="main")
             repo.update_file(java_file.path, "Update Java Code from Bot", java_content, java_file.sha, branch="main")
         except Exception:
-            repo.create_file("app/src/main/java/com/flare/compiler/MainActivity.java", "Create Java Code from Bot", java_content, branch="main")
+            try:
+                repo.create_file("app/src/main/java/com/flare/compiler/MainActivity.java", "Create Java Code from Bot", java_content, branch="main")
+            except Exception as e_jav:
+                await status_msg.edit_text(f"❌ Не удалось записать MainActivity.java:\n`{str(e_jav)}`")
+                return
 
-        await status_msg.edit_text("🚀 Код успешно отправлен! Запуск Gradle-сборщика в облаке GitHub...")
+        await status_msg.edit_text("🚀 Шаг 4: Запуск Gradle сборки...")
         await asyncio.sleep(6) 
-        
-        # Мониторинг процесса сборки
-        await status_msg.edit_text("⏳ Компиляция приложения Android (обычно занимает 1-2 минуты)...")
         
         success_build = False
         run_id = None
         
-        # Опрашиваем статусы последних запусков workflow
         for _ in range(35): 
             await asyncio.sleep(10)
-            runs = repo.get_workflow_runs(branch="main")
-            if runs.totalCount > 0:
-                latest_run = runs[0] 
-                run_id = latest_run.id
-                status = latest_run.status       
-                conclusion = latest_run.conclusion 
-                
-                if status == "in_progress":
-                    await status_msg.edit_text("⚙️ Gradle компилирует Java классы и собирает ресурсы пакета...")
-                elif status == "completed":
-                    if conclusion == "success":
-                        success_build = True
-                        break
-                    else:
-                        await status_msg.edit_text("❌ Ошибка компиляции на стороне Gradle! Проверь синтаксис Java-кода.")
-                        return
+            try:
+                runs = repo.get_workflow_runs(branch="main")
+                if runs.totalCount > 0:
+                    latest_run = runs[0] 
+                    run_id = latest_run.id
+                    status = latest_run.status       
+                    conclusion = latest_run.conclusion 
+                    
+                    if status == "in_progress":
+                        await status_msg.edit_text("⚙️ Gradle компилирует приложение в облаке...")
+                    elif status == "completed":
+                        if conclusion == "success":
+                            success_build = True
+                            break
+                        else:
+                            await status_msg.edit_text("❌ Ошибка компиляции Gradle на GitHub Actions!")
+                            return
+            except Exception:
+                pass
 
         if not success_build or not run_id:
-            await status_msg.edit_text("❌ Время ожидания сборки истекло. Попробуйте еще раз.")
+            await status_msg.edit_text("❌ Время ожидания сборки истекло.")
             return
 
-        await status_msg.edit_text("📦 Сборка завершена! Скачивание готового APK артефакта...")
+        await status_msg.edit_text("📦 Шаг 5: Получение готового APK...")
         
-        # Получаем ссылку на скачивание скомпилированного APK артефакта
-        artifacts = repo.get_artifacts()
-        apk_artifact = None
-        for art in artifacts:
-            if art.name == "app-debug": 
-                apk_artifact = art
-                break
-        
-        if not apk_artifact:
-            await status_msg.edit_text("❌ Ошибка: APK файл был собран, но артефакт не найден в репозитории.")
+        try:
+            artifacts = repo.get_artifacts()
+            apk_artifact = None
+            for art in artifacts:
+                if art.name == "app-debug": 
+                    apk_artifact = art
+                    break
+            
+            if not apk_artifact:
+                await status_msg.edit_text("❌ Сборка завершена, но артефакт 'app-debug' не найден.")
+                return
+        except Exception as e_art:
+            await status_msg.edit_text(f"❌ Ошибка получения артефактов:\n`{str(e_art)}`")
             return
 
         await status_msg.delete()
@@ -372,15 +375,13 @@ async def build_apk_process(callback: types.CallbackQuery):
         await callback.message.answer(
             f"📦 **Ваше настоящее Android-приложение успешно собрано!**\n\n"
             f"📱 Проект: `{proj['name']}`\n"
-            f"⚙️ Платформа: `Android OS (SDK 24+)`\n\n"
-            f"GitHub заархивировал ваш `.apk` файл для безопасности. Нажмите на кнопку ниже, перейдите в раздел **Artifacts** внизу страницы и скачайте файл `app-debug`!",
+            f"GitHub заархивировал ваш `.apk`. Нажмите кнопку ниже, пролистайте страницу вниз до раздела **Artifacts** и скачайте файл `app-debug`!",
             parse_mode="Markdown",
             reply_markup=builder.as_markup()
         )
 
     except Exception as e:
-        print(f"Build System Error: {e}")
-        await status_msg.edit_text(f"❌ Критическая ошибка сборщика:\n`{str(e)}` \nПроверь корректность путей к файлам в твоем репозитории.")
+        await status_msg.edit_text(f"❌ Общая критическая ошибка:\n`{str(e)}`")
 
 # ─────────────────────────────────────────────────────────
 # 🌍 БЛОК 4: ВЕБ-СЕРВЕР И СТАРТ СИСТЕМЫ
@@ -395,7 +396,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("🤖 Среда разработки FlareBuilder + Cloud Android SDK запущена!")
+    print("🤖 Среда FlareBuilder запущена!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
