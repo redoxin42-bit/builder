@@ -10,7 +10,7 @@ from aiogram.types import BufferedInputFile
 from supabase import create_client, Client
 from aiohttp import web
 
-# Загрузка конфигурации
+# 1. ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -18,12 +18,17 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
-# Инициализация
+# Проверка критических данных
+if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
+    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи в .env файле или настройках Environment!")
+    exit(1)
+
+# Инициализация клиентов
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния FSM
+# Состояния FSM для пошагового ввода данных
 class ProjectStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_file_name = State()
@@ -35,7 +40,8 @@ class ProjectStates(StatesGroup):
 
 def get_user_projects(user_id: int):
     try:
-        res = supabase.table("projects").select("*").eq("user_id", str(user_id)).execute()
+        # Передаем user_id как integer (соответствует int8/bigint в Supabase)
+        res = supabase.table("projects").select("*").eq("user_id", user_id).execute()
         return res.data
     except Exception as e:
         print(f"Database Error (get_projects): {e}")
@@ -50,22 +56,25 @@ def get_project_by_id(project_id: int):
         return None
 
 def create_project(user_id: int, project_name: str):
+    """Создание проекта и генерация базовых файлов Android"""
     try:
+        # Шаг 1: Создаем запись проекта
         proj_res = supabase.table("projects").insert({
-            "user_id": str(user_id), 
+            "user_id": user_id, 
             "name": project_name
         }).execute()
         
         if not proj_res.data:
-            return None
+            return None, "БД вернула пустой ответ. Возможно, включен RLS (Row Level Security) без политик INSERT."
             
         project_id = proj_res.data[0]["id"]
 
+        # Дефолтный код файлов Android Studio
         manifest_code = (
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
             f'    package="com.example.{project_name.lower()}">\n'
-            '    <application android:label="{project_name}">\n'
+            f'    <application android:label="{project_name}">\n'
             '    </application>\n'
             '</manifest>'
         )
@@ -86,15 +95,16 @@ def create_project(user_id: int, project_name: str):
             "}"
         )
 
+        # Шаг 2: Заливаем базовые файлы
         supabase.table("files").insert([
             {"project_id": project_id, "name": "AndroidManifest.xml", "content": manifest_code},
             {"project_id": project_id, "name": "MainActivity.java", "content": java_code}
         ]).execute()
         
-        return project_id
+        return project_id, None
     except Exception as e:
         print(f"Database Error (create_project): {e}")
-        return None
+        return None, str(e)
 
 def get_project_files(project_id: int):
     try:
@@ -125,7 +135,7 @@ def get_file_content(file_id: int):
         return None
 
 # ─────────────────────────────────────────────────────────
-# ⌨️ БЛОК 2: КЛАВИАТУРЫ (ИСПРАВЛЕННЫЙ БАГ ЛУПА)
+# ⌨️ БЛОК 2: ГЕНЕРАЦИЯ ИНТЕРФЕЙСА (КЛАВИАТУРЫ)
 # ─────────────────────────────────────────────────────────
 
 def get_main_menu():
@@ -180,7 +190,7 @@ def get_file_view_keyboard(project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ БОТА
+# 📡 БЛОК 3: ХЕНДЛЕРЫ И ОБРАБОТКА КОМАНД
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -211,9 +221,10 @@ async def list_projects(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "new_project")
 async def create_project_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите название проекта (английскими буквами, например: SmartApp):")
+    await callback.message.edit_text("Введите название проекта (только английские буквы/цифры, например: FlareApp):")
     await state.set_state(ProjectStates.waiting_for_name)
 
+# --- ТОТ САМЫЙ ХЕНДЛЕР С ДИАГНОСТИКОЙ ОШИБОК SUPABASE ---
 @dp.message(ProjectStates.waiting_for_name)
 async def create_project_save(message: types.Message, state: FSMContext):
     project_name = message.text.strip()
@@ -221,13 +232,21 @@ async def create_project_save(message: types.Message, state: FSMContext):
         await message.answer("❌ Название должно состоять только из букв и цифр. Попробуй еще раз:")
         return
 
-    pid = create_project(message.from_user.id, project_name)
+    pid, err_msg = create_project(message.from_user.id, project_name)
     await state.clear()
     
     if pid:
-        await message.answer(f"✅ Проект **{project_name}** создан!", reply_markup=get_project_manage_menu(pid))
+        await message.answer(f"✅ Проект **{project_name}** успешно создан!", reply_markup=get_project_manage_menu(pid))
     else:
-        await message.answer("❌ Произошла ошибка при создании проекта в базе данных.", reply_markup=get_main_menu())
+        await message.answer(
+            f"❌ **Ошибка базы данных при создании проекта!**\n\n"
+            f"🔍 **Лог ошибки от Supabase:**\n`{err_msg}`\n\n"
+            f"💡 **План действий:**\n"
+            f"1. Открой Supabase -> Таблица `projects`.\n"
+            f"2. Проверь, что тип колонки `user_id` равен `int8` (или `text`).\n"
+            f"3. Если включен **RLS**, отключи его (кнопка *Disable RLS* над структурой таблицы) или добавь политику разрешений (Policy) на операции INSERT и SELECT.",
+            reply_markup=get_main_menu()
+        )
 
 @dp.callback_query(F.data.startswith("manage_proj_"))
 async def manage_project(callback: types.CallbackQuery, state: FSMContext):
@@ -240,7 +259,7 @@ async def manage_project(callback: types.CallbackQuery, state: FSMContext):
     else:
         await callback.answer("Проект не найден.", show_alert=True)
 
-# 📁 Вкладка: Архитектура папок
+# Вкладка: Архитектура папок
 @dp.callback_query(F.data.startswith("arch_proj_"))
 async def view_architecture(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
@@ -250,7 +269,6 @@ async def view_architecture(callback: types.CallbackQuery):
     if not proj:
         return
 
-    # Строим дерево структуры
     tree = f"📦 **{proj['name']}**\n"
     tree += " ┗ 📂 app\n"
     tree += " ┃ ┗ 📂 src\n"
@@ -261,37 +279,36 @@ async def view_architecture(callback: types.CallbackQuery):
         if f['name'].endswith('.java'):
             tree += f" ┃ ┃ ┃ ┃ ┗ 📄 {f['name']}\n"
             
-    tree += " ┃ ┃ ┃ ┗ 📂 res/layout (Генерация ресурсов)\n"
+    tree += " ┃ ┃ ┃ ┗ 📂 res/layout (Ресурсы разметки)\n"
     tree += " ┃ ┃ ┃ ┗ 📄 AndroidManifest.xml\n"
     
-    # Добавляем кастомные файлы пользователя в корень структуры для наглядности
     custom_files = [f for f in files if f['name'] not in ['MainActivity.java', 'AndroidManifest.xml']]
     if custom_files:
         tree += " ┃ ┗ 📂 custom_modules\n"
         for cf in custom_files:
             tree += f" ┃ ┃ ┗ 📄 {cf['name']}\n"
             
-    tree += " ┗ 📄 build.gradle (Скрипт автоматизации)"
+    tree += " ┗ 📄 build.gradle (Gradle Script)"
 
     await callback.message.edit_text(
-        f"⚙️ **Логическая архитектура Android Studio:**\n\n```text\n{tree}\n```",
+        f"⚙️ **Логическая архитектура проекта в Android Studio:**\n\n```text\n{tree}\n```",
         parse_mode="Markdown",
         reply_markup=get_architecture_menu(project_id)
     )
 
-# ➕ Ручное добавление файлов
+# Пошаговое добавление пользовательских файлов
 @dp.callback_query(F.data.startswith("add_file_"))
 async def add_file_start(callback: types.CallbackQuery, state: FSMContext):
     project_id = int(callback.data.split("_")[2])
     await state.update_data(project_id=project_id)
-    await callback.message.edit_text("Введите имя нового файла вместе с расширением (например: strings.xml или Helper.java):")
+    await callback.message.edit_text("Введите имя нового файла вместе с расширением (например: strings.xml или MyClass.java):")
     await state.set_state(ProjectStates.waiting_for_file_name)
 
 @dp.message(ProjectStates.waiting_for_file_name)
 async def add_file_name_save(message: types.Message, state: FSMContext):
     filename = message.text.strip()
     await state.update_data(filename=filename)
-    await message.answer(f"Отлично. Теперь отправьте код/содержимое для файла `{filename}`:")
+    await message.answer(f"Принято. Теперь введите или вставьте код (содержимое) для файла `{filename}`:")
     await state.set_state(ProjectStates.waiting_for_file_content)
 
 @dp.message(ProjectStates.waiting_for_file_content)
@@ -305,16 +322,16 @@ async def add_file_content_save(message: types.Message, state: FSMContext):
     await state.clear()
     
     if res:
-        await message.answer(f"✅ Файл `{filename}` добавлен в архитектуру проекта!", reply_markup=get_project_manage_menu(project_id))
+        await message.answer(f"✅ Файл `{filename}` успешно добавлен в архитектуру проекта!", reply_markup=get_project_manage_menu(project_id))
     else:
-        await message.answer("❌ Не удалось сохранить файл.", reply_markup=get_project_manage_menu(project_id))
+        await message.answer("❌ Ошибка при записи файла в базу данных.", reply_markup=get_project_manage_menu(project_id))
 
-# 📄 Вкладка: Список файлов (Код)
+# Просмотр исходного кода файлов
 @dp.callback_query(F.data.startswith("files_proj_"))
 async def list_project_files(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
     files = get_project_files(project_id)
-    await callback.message.edit_text("Исходный код файлов проекта. Выберите файл для редактирования:", reply_markup=get_files_keyboard(project_id, files))
+    await callback.message.edit_text("Выберите файл проекта для чтения исходного кода:", reply_markup=get_files_keyboard(project_id, files))
 
 @dp.callback_query(F.data.startswith("view_file_"))
 async def view_file(callback: types.CallbackQuery):
@@ -330,44 +347,43 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{file_data['name']}`\n────────────────────\n```java\n{file_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(project_id))
 
-# 🚀 Вкладка: Реализация компиляции APK (С Hello World)
+# Компиляция и сборка APK (Симуляция Gradle билдера)
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
     proj = get_project_by_id(project_id)
     
-    # Имитируем процесс компиляции через последовательное редактирование сообщений
-    msg = await callback.message.answer("🚀 Инициализация компилятора Android SDK на сервере...")
+    msg = await callback.message.answer("🚀 Инициализация компилятора Android SDK на удаленном сервере...")
     await asyncio.sleep(1.5)
     
-    await msg.edit_text("⏳ [1/3] Чтение манифеста и архитектуры исходного кода...")
+    await msg.edit_text("⏳ [1/3] Линковка манифеста, компиляция Java/Kotlin классов...")
     await asyncio.sleep(1.5)
     
-    await msg.edit_text("⚙️ [2/3] Запуск сборщика Gradle: линковка ресурсов и компиляция байткода 'Hello World'...")
+    await msg.edit_text("⚙️ [2/3] Запуск сборщика Gradle: обработка ресурсов, генерация байткода 'Hello World'...")
     await asyncio.sleep(2)
     
-    await msg.edit_text("📦 [3/3] Сборка пакета и подпись тестовым ключом (signing debug APK)...")
+    await msg.edit_text("📦 [3/3] Оптимизация ProGuard и подпись пакета (Signing debug APK)...")
     await asyncio.sleep(1)
     
     await msg.delete()
     
-    # Создаем фиктивный бинарный поток, имитирующий скомпилированный APK-файл
+    # Создаем бинарный имитатор готового .apk файла
     fake_apk_data = b"AndroidAPK_HelloWorld_Mock_Binary_Data_Stream_FlareBuilder"
     apk_file = BufferedInputFile(fake_apk_data, filename=f"{proj['name'].lower()}-debug.apk")
     
     await callback.message.reply_document(
         document=apk_file,
         caption=(
-            f"✅ **APK-файл успешно собран!**\n\n"
+            f"✅ **APK-файл успешно скомпилирован!**\n\n"
             f"📦 Проект: `{proj['name']}`\n"
-            f"📱 Архитектура: `Universal (ARM/x86)`\n"
-            f"📝 Интегрированный код: Базовый вывод текстовой надписи *'Hello World'* через динамический `TextView`."
+            f"📱 Платформа: `Universal (ARM64/x86_64)`\n"
+            f"📝 Описание: Приложение содержит базовый текстовый вывод *'Hello World'* через динамический компонент `TextView`."
         ),
         parse_mode="Markdown"
     )
 
 # ─────────────────────────────────────────────────────────
-# 🌍 БЛОК 4: ВЕБ-СЕРВЕР И СТАРТ
+# 🌍 БЛОК 4: ФЕЙК-СЕРВЕР ДЛЯ RENDER И СТАРТ СИСТЕМЫ
 # ─────────────────────────────────────────────────────────
 
 async def handle_ping(request):
@@ -383,7 +399,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("🤖 FlareBuilder успешно запущен!")
+    print("🤖 FlareBuilder успешно запущен на хостинге!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
