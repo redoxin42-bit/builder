@@ -127,9 +127,21 @@ async def stub_build_apk(callback: types.CallbackQuery):
     """Заглушка для компиляции через GitHub Actions"""
     await callback.answer("🚀 Модуль сборки через GitHub Actions будет подключен на следующем этапе!", show_alert=True)
 
-# --- ЗАПУСК БОТА ---
+# --- ФЕЙКОВЫЙ СЕРВЕР ДЛЯ ОБХОДА ПРОВЕРКИ ПОРТА RENDER ---
+async def handle_render_ping(reader, writer):
+    """Отвечает Render'у, что наше приложение живое"""
+    await reader.read(100)
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+    writer.write(response.encode())
+    await writer.drain()
+    writer.close()
 
+# --- ЗАПУСК БОТА ---
 async def main():
+    # Поднимаем пустой порт для Render, чтобы он успокоился
+    port = int(os.getenv("PORT", 8080))
+    await asyncio.start_server(handle_render_ping, "0.0.0.0", port)
+    
     print("Бот успешно запущен на раздельной архитектуре!")
     await dp.start_polling(bot)
 
