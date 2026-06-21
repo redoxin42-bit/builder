@@ -18,16 +18,21 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
 PORT = int(os.getenv("PORT", 8080))
 
+# 🛠 БРОНЕБОЙНЫЙ ПАРСЕР ССЫЛКИ РЕПОЗИТОРИЯ
+# Вырезает "логин/репозиторий" из абсолютно любого формата, введенного на Render
+raw_repo = os.getenv("GITHUB_REPO", "").strip()
+raw_repo = raw_repo.replace("https://", "").replace("http://", "").replace("github.com/", "")
+if raw_repo.endswith("/"):
+    raw_repo = raw_repo[:-1]
+
+GITHUB_REPO_CLEANED = raw_repo
+
 # Проверка критических данных
-if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO]):
+if not all([BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO_CLEANED]):
     print("❌ КРИТИЧЕСКАЯ ОШИБКА: Проверь ключи Supabase и GitHub в Environment!")
     exit(1)
-
-# Очищаем строку репозитория от случайных пробелов
-GITHUB_REPO_CLEANED = GITHUB_REPO.strip()
 
 # Инициализация клиентов
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -186,14 +191,14 @@ def get_file_view_keyboard(project_id: int):
     return builder.as_markup()
 
 # ─────────────────────────────────────────────────────────
-# 📡 БЛОК 3: ХЕНДЛЕРЫ С ТОЧНОЙ ДИАГНОСТИКОЙ ОШИБОК
+# 📡 БЛОК 3: ХЕНДЛЕРЫ И СБОРКА APK С ДИАГНОСТИКОЙ И ОБТЕКАНИЕМ ОШИБОК
 # ─────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        f"Привет, {message.from_user.full_name}! 👋\nСреда разработки FlareBuilder подключена.",
+        f"Привет, {message.from_user.full_name}! 👋\nСреда разработки FlareBuilder подключена к компилятору.",
         reply_markup=get_main_menu()
     )
 
@@ -266,7 +271,7 @@ async def view_file(callback: types.CallbackQuery):
     text = f"📄 **Файл:** `{file_data['name']}`\n```java\n{file_data['content']}\n```"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_file_view_keyboard(project_id))
 
-# 🔥 ХЕНДЛЕР СБОРКИ С ДИАГНОСТИКОЙ ПОЭТАПНО
+# ХЕНДЛЕР СБОРКИ С УЛУЧШЕННОЙ ОБРАБОТКОЙ ОШИБОК И ФОРМАТОВ ССЫЛОК
 @dp.callback_query(F.data.startswith("build_apk_"))
 async def build_apk_process(callback: types.CallbackQuery):
     project_id = int(callback.data.split("_")[2])
@@ -287,7 +292,11 @@ async def build_apk_process(callback: types.CallbackQuery):
         try:
             repo = github_client.get_repo(GITHUB_REPO_CLEANED)
         except Exception as e_repo:
-            await status_msg.edit_text(f"❌ Ошибка на этапе поиска репозитория `{GITHUB_REPO_CLEANED}`:\n`{str(e_repo)}` \n\nПроверь, чтобы токен имел доступ к этому репозиторию!")
+            await status_msg.edit_text(
+                f"❌ Ошибка на этапе поиска репозитория `{GITHUB_REPO_CLEANED}`:\n`{str(e_repo)}` \n\n"
+                f"Проверь настройки твоего Personal Access Token на GitHub! Если это Fine-grained токен, "
+                f"убедись, что в пункте Repository Access выбран именно этот репозиторий."
+            )
             return
 
         await status_msg.edit_text("📝 Шаг 2: Загрузка Манифеста на GitHub...")
